@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>智能咖啡杯 WebBLE 控制 Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 18px; max-width: 760px; margin:auto; }
+    button { padding: 10px 14px; margin:6px; }
+    .status { margin:10px 0; }
+    .card { border:1px solid #ddd; padding:12px; border-radius:8px; margin-top:12px; }
+    label { display:block; margin-top:8px; }
+    #log { white-space: pre-wrap; background:#f7f7f7; padding:10px; height:140px; overflow:auto; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <h1>智能咖啡杯 WebBLE Demo（Android Chrome）</h1>
+
+  <div class="card">
+    <div>
+      <button id="btnConnect">连接设备</button>
+      <button id="btnDisconnect" disabled>断开连接</button>
+    </div>
+    <div class="status"><strong>连接状态：</strong><span id="connStatus">未连接</span></div>
+    <div class="card">
+      <div><strong>实时读数</strong></div>
+      <div>温度: <span id="tempValue">—</span> °C</div>
+      <div>电量: <span id="batteryValue">—</span> %</div>
+      <div>干烧状态: <span id="dryBurnStatus">—</span></div>
+      <div>温度单位: <span id="tempUnit">—</span></div>
+    </div>
+
+    <div class="card">
+      <div><strong>控制</strong></div>
+      <label>设置加热温度：
+        <input id="tempSlider" type="range" min="30" max="65" value="50" disabled>
+        <span id="tempSet">50</span> °C
+        <button id="btnSetTemp" disabled>设置温度</button>
+      </label>
+      <label>选择加热种类：
+        <select id="heatingMode" disabled>
+          <option value="0">水 50°</option>
+          <option value="1">茶 55°</option>
+          <option value="2">咖啡 65°</option>
+          <option value="3">果汁 35°</option>
+        </select>
+        <button id="btnSetMode" disabled>设置加热种类</button>
+      </label>
+      <label>切换温度单位：
+        <button id="btnSwitchUnit" disabled>切换单位</button>
+      </label>
+    </div>
+
+    <div class="card">
+      <div><strong>日志</strong></div>
+      <div id="log"></div>
+    </div>
+  </div>
+
+<script>
+// 协议中的 UUIDs
+const SERVICE_UUID = 'FFE0';  // 替换为你的 service UUID
+const WRITE_CHAR_UUID = 'FFE1'; // 写特征 UUID
+const NOTIFY_CHAR_UUID = 'FFE2'; // 通知特征 UUID
+
+let device = null;
+let server = null;
+let writeChar = null;
+let notifyChar = null;
+
+const $ = id => document.getElementById(id);
+const log = msg => {
+  const el = $('log');
+  const t = new Date().toLocaleTimeString();
+  el.textContent = `[${t}] ${msg}\n` + el.textContent;
+};
+
+function hexStringToUint8Array(hex) {
+  hex = hex.replace(/\s+/g,'');
+  if (hex.length % 2) hex = '0' + hex;
+  const arr = new Uint8Array(hex.length/2);
+  for (let i=0;i<arr.length;i++){
+    arr[i] = parseInt(hex.substr(i*2,2), 16);
+  }
+  return arr;
+}
+
+// ---------- 协议特定：构建命令和解析通知 ----------
+
+function buildCommand(cmdName, params) {
+  if (cmdName === 'set_temp') {
+    const t = params.temp || 50;
+    return new Uint8Array([0xAA, 0xA1, t, 0xBB]);
+  }
+  if (cmdName === 'set_mode') {
+    return new Uint8Array([0xAA, 0xA2, params.mode, 0xBB]);
+  }
+  if (cmdName === 'switch_unit') {
+    return new Uint8Array([0xAA, 0xA3, params.unit, 0xBB]);
+  }
+  throw new Error('未知命令：' + cmdName);
+}
+
+function parseNotification(event) {
+  const value = event.target.value;
+  const arr = new Uint8Array(value.buffer || value);
+
+  if (arr.length >= 4) {
+    const cmd = arr[1];
+    if (cmd === 0xB1) {  // 电量上传
+      const battery = arr[2];
+      $('batteryValue').textContent = battery + '%';
+      log('电池电量：' + battery + '%');
+    } else if (cmd === 0xB2) {  // 温度上传
+      const temp = arr[2] + (arr[3] / 100); // 例如：30 + 0.5 => 30.5
+      $('tempValue').textContent = temp.toFixed(1);
+      log('当前温度：' + temp + '°C');
+    } else if (cmd === 0xB5) {  // 干烧状态
+      const dryBurnStatus = arr[2] === 1 ? '干烧' : '正常';
+      $('dryBurnStatus').textContent = dryBurnStatus;
+      log('干烧状态：' + dryBurnStatus);
+    } else if (cmd === 0xB4) {  // 温度单位
+      const unit = arr[2] === 0 ? '摄氏度' : '华氏度';
+      $('tempUnit').textContent = unit;
+      log('温度单位：' + unit);
+    }
+  }
+}
+
+function bufferToHex(buf) {
+  return Array.from(buf).map(b => b.toString(16).padStart(2,'0')).join(' ');
+}
+
+// ---------- BLE 连接和控制 ----------
+
+async function connect() {
+  try {
+    log('开始扫描设备...');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    log('设备已选择: ' + device.name);
+
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+
+    writeChar = await service.getCharacteristic(WRITE_CHAR_UUID);
+    notifyChar = await service.getCharacteristic(NOTIFY_CHAR_UUID);
+
+    await notifyChar.startNotifications();
+    notifyChar.addEventListener('characteristicvaluechanged', parseNotification);
+
+    onConnected();
+  } catch (err) {
+    log('连接失败：' + err);
+  }
+}
+
+function onConnected() {
+  $('connStatus').textContent = '已连接: ' + (device.name || device.id);
+  $('btnConnect').disabled = true;
+  $('btnDisconnect').disabled = false;
+  $('btnSetTemp').disabled = false;
+  $('btnSetMode').disabled = false;
+  $('btnSwitchUnit').disabled = false;
+}
+
+function onDisconnected() {
+  log('设备已断开');
+  $('connStatus').textContent = '未连接';
+  $('btnConnect').disabled = false;
+  $('btnDisconnect').disabled = true;
+  $('btnSetTemp').disabled = true;
+  $('btnSetMode').disabled = true;
+  $('btnSwitchUnit').disabled = true;
+  writeChar = null;
+  notifyChar = null;
+}
+
+async function writeCommand(cmdName, params) {
+  if (!writeChar) {
+    throw new Error('尚未获取写特征');
+  }
+  const payload = buildCommand(cmdName, params);
+  log('发送命令: ' + cmdName + ' -> ' + bufferToHex(payload));
+  await writeChar.writeValue(payload);
+}
+
+async function disconnect() {
+  if (device) {
+    device.gatt.disconnect();
+    onDisconnected();
+  }
+}
+
+// UI 绑定
+$('btnConnect').addEventListener('click', () => connect());
+$('btnDisconnect').addEventListener('click', () => disconnect());
+$('btnSetTemp').addEventListener('click', async () => {
+  const temp = parseInt($('tempSlider').value, 10);
+  await writeCommand('set_temp', { temp });
+});
+$('btnSetMode').addEventListener('click', async () => {
+  const mode = parseInt($('heatingMode').value, 10);
+  await writeCommand('set_mode', { mode });
+});
+$('btnSwitchUnit').addEventListener('click', async () => {
+  const unit = $('tempUnit').textContent === '摄氏度' ? 1 : 0;
+  await writeCommand('switch_unit', { unit });
+});
+
+</script>
+</body>
+</html>
